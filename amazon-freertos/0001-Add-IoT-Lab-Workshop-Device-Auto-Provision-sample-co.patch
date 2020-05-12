@@ -1,0 +1,1199 @@
+From c537c972f7b3c7df13cadb83e172c27129c4fb4f Mon Sep 17 00:00:00 2001
+From: tec <tec@amazon.com>
+Date: Tue, 12 May 2020 15:50:46 +0800
+Subject: [PATCH] Add IoT Lab Workshop Device Auto Provision sample code
+
+---
+ .../dev_mode_key_provisioning/CMakeLists.txt  |   1 +
+ .../src/aws_dev_mode_key_provisioning.c       | 190 ++++++++++-
+ demos/include/aws_clientcredential_keys.h     |   6 +-
+ demos/include/iot_demo_runner.h               |   2 +
+ demos/jitr/CMakeLists.txt                     |  16 +
+ demos/jitr/jitr.c                             | 315 ++++++++++++++++++
+ libraries/c_sdk/aws/keygen/CMakeLists.txt     |  30 ++
+ .../aws/keygen/include/aws_iot_key_gen.h      |  38 +++
+ .../c_sdk/aws/keygen/src/aws_iot_key_gen.c    | 293 ++++++++++++++++
+ tests/include/aws_clientcredential_keys.h     |   6 +-
+ .../amazon-freertos-common/component.mk       |   6 +-
+ .../aws_demos/config_files/aws_demo_config.h  |   9 +-
+ .../aws_demos/config_files/aws_jitr_config.h  |   8 +
+ .../amazon-freertos-tests/component.mk        |   6 +-
+ .../aws_tests/config_files/aws_jitr_config.h  |   8 +
+ 15 files changed, 926 insertions(+), 8 deletions(-)
+ create mode 100644 demos/jitr/CMakeLists.txt
+ create mode 100644 demos/jitr/jitr.c
+ create mode 100644 libraries/c_sdk/aws/keygen/CMakeLists.txt
+ create mode 100644 libraries/c_sdk/aws/keygen/include/aws_iot_key_gen.h
+ create mode 100644 libraries/c_sdk/aws/keygen/src/aws_iot_key_gen.c
+ create mode 100644 vendors/espressif/boards/esp32/aws_demos/config_files/aws_jitr_config.h
+ create mode 100644 vendors/espressif/boards/esp32/aws_tests/config_files/aws_jitr_config.h
+
+diff --git a/demos/dev_mode_key_provisioning/CMakeLists.txt b/demos/dev_mode_key_provisioning/CMakeLists.txt
+index 1eb41a2f7..9755143e2 100644
+--- a/demos/dev_mode_key_provisioning/CMakeLists.txt
++++ b/demos/dev_mode_key_provisioning/CMakeLists.txt
+@@ -20,5 +20,6 @@ afr_module_dependencies(
+     ${AFR_CURRENT_MODULE}
+     PUBLIC
+         AFR::pkcs11
++        AFR::keygen
+         3rdparty::mbedtls
+ )
+diff --git a/demos/dev_mode_key_provisioning/src/aws_dev_mode_key_provisioning.c b/demos/dev_mode_key_provisioning/src/aws_dev_mode_key_provisioning.c
+index 16b6836b2..7bf47e07d 100644
+--- a/demos/dev_mode_key_provisioning/src/aws_dev_mode_key_provisioning.c
++++ b/demos/dev_mode_key_provisioning/src/aws_dev_mode_key_provisioning.c
+@@ -51,9 +51,17 @@
+ 
+ /* Key provisioning includes. */
+ #include "aws_dev_mode_key_provisioning.h"
++#include "aws_demo_config.h"
+ 
+ /* mbedTLS includes. */
+ #include "mbedtls/base64.h"
++#include "mbedtls/x509_crt.h"
++#include "mbedtls/x509_csr.h"
++
++/* generante key and certificate includes. */
++#include "aws_iot_key_gen.h"
++#include "iot_threads.h"
++
+ /*-----------------------------------------------------------*/
+ 
+ /* Key provisioning helper defines. */
+@@ -63,6 +71,11 @@
+ 
+ /*-----------------------------------------------------------*/
+ 
++/* Auto generate key/req/cert defines. */
++#define MAX_AUTOGEN_ARRAY_SIZE  2048
++
++/*-----------------------------------------------------------*/
++
+ CK_RV xInitializePkcsSession( CK_FUNCTION_LIST_PTR * ppxFunctionList,
+                               CK_SLOT_ID * pxSlotId,
+                               CK_SESSION_HANDLE * pxSession )
+@@ -304,6 +317,118 @@ CK_RV xProvisionDevice( CK_SESSION_HANDLE xSession,
+ 
+     return xResult;
+ }
++
++CK_RV xVerifyKeyAndCert( CK_FUNCTION_LIST_PTR * ppxFunctionList,
++                              CK_SLOT_ID * pxSlotId,
++                              CK_SESSION_HANDLE * pxSession )
++{
++    /* Find the certificate */
++    CK_ATTRIBUTE xTemplate;
++    CK_RV xResult = CKR_OK;
++    CK_ULONG ulCount = 0;
++    const char * pcLabelName = pkcs11configLABEL_DEVICE_PRIVATE_KEY_FOR_TLS;
++    CK_OBJECT_HANDLE xHandle;
++    CK_BYTE * pxCertificate = NULL;
++    mbedtls_x509_crt xMbedX509Cli;
++
++    xTemplate.type = CKA_LABEL;
++    xTemplate.ulValueLen = strlen( pcLabelName ) + 1;
++    xTemplate.pValue = ( char * ) pcLabelName;
++
++    xResult = ( *ppxFunctionList )->C_FindObjectsInit( *pxSession, &xTemplate, 1 );
++
++    if( xResult == CKR_OK )
++    {
++        xResult = ( *ppxFunctionList )->C_FindObjects( *pxSession,
++                                                 &xHandle,
++                                                 1,
++                                                 &ulCount );
++    }
++
++    if( xResult == CKR_OK )
++    {
++        xResult = ( *ppxFunctionList )->C_FindObjectsFinal( *pxSession );
++
++        xTemplate.ulValueLen = sizeof( pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS );
++        xTemplate.pValue = &pkcs11configLABEL_DEVICE_CERTIFICATE_FOR_TLS;
++        xResult = ( *ppxFunctionList )->C_FindObjectsInit( *pxSession,
++                                                            &xTemplate,
++                                                            1 );
++
++        if( 0 == xResult )
++        {
++            xResult = ( *ppxFunctionList )->C_FindObjects( *pxSession,
++                                                            &xHandle,
++                                                            1,
++                                                            &ulCount );
++        }
++
++        if( 0 == xResult )
++        {
++            xResult = ( *ppxFunctionList )->C_FindObjectsFinal( *pxSession );
++        }
++
++        if( 0 == xResult )
++        {
++            /* Query the device certificate size. */
++            xTemplate.type = CKA_VALUE;
++            xTemplate.ulValueLen = 0;
++            xTemplate.pValue = NULL;
++            xResult = ( *ppxFunctionList )->C_GetAttributeValue( *pxSession,
++                                                                  xHandle,
++                                                                  &xTemplate,
++                                                                  1 );
++        }
++
++        if( 0 == xResult )
++        {
++            /* Create a buffer for the certificate. */
++            pxCertificate = ( CK_BYTE_PTR ) pvPortMalloc( xTemplate.ulValueLen ); /*lint !e9079 Allow casting void* to other types. */
++
++            if( NULL == pxCertificate )
++            {
++                xResult = ( BaseType_t ) CKR_HOST_MEMORY;
++            }
++        }
++
++        if( 0 == xResult )
++        {
++            /* Export the certificate. */
++            xTemplate.pValue = pxCertificate;
++            xResult = ( *ppxFunctionList )->C_GetAttributeValue( *pxSession,
++                                                                  xHandle,
++                                                                  &xTemplate,
++                                                                  1 );
++        }
++
++        /* Decode the client certificate. */
++        if( 0 == xResult )
++        {
++            mbedtls_x509_crt_init( &xMbedX509Cli );
++            xResult = mbedtls_x509_crt_parse( &xMbedX509Cli,
++                                              ( const unsigned char * ) pxCertificate,
++                                              xTemplate.ulValueLen );
++        }
++
++        if( 0 == xResult )
++        {
++            /* TODO: compare with current date */
++            configPRINTF( ( "Certificate valid date: %d/%d/%d/%d/%d/%d.\n", xMbedX509Cli.valid_to.year,
++                                                                            xMbedX509Cli.valid_to.mon,
++                                                                            xMbedX509Cli.valid_to.day,
++                                                                            xMbedX509Cli.valid_to.hour,
++                                                                            xMbedX509Cli.valid_to.min,
++                                                                            xMbedX509Cli.valid_to.sec ) );
++        }
++    }
++
++    if( NULL != pxCertificate )
++    {
++        vPortFree( pxCertificate );
++    }
++
++    return xResult;
++}
+ /*-----------------------------------------------------------*/
+ 
+ void vAlternateKeyProvisioning( ProvisioningParams_t * xParams )
+@@ -312,15 +437,78 @@ void vAlternateKeyProvisioning( ProvisioningParams_t * xParams )
+     CK_FUNCTION_LIST_PTR pxFunctionList = NULL;
+     CK_SLOT_ID xSlotId = 0;
+     CK_SESSION_HANDLE xSession = 0;
++#if defined( CONFIG_JITR_DEMO_ENABLED )
++    devCertificateKeyContext_t jitrDemoContext = 
++    {
++        .pcJITRClientPrivateKey = NULL,
++        .pcJITRClientCertificate = NULL,
++        .pcJITRClientTempRequest = NULL
++    };
++#endif
+ 
+     /* Initialize the PKCS Module */
+     xResult = xInitializePkcsSession( &pxFunctionList,
+                                       &xSlotId,
+                                       &xSession );
+ 
+-    if( xResult == CKR_OK )
++    if ( xResult == CKR_OK )
+     {
++#if defined( CONFIG_JITR_DEMO_ENABLED )
++        /* Check flash to see if there is already a certificate */
++        xResult = xVerifyKeyAndCert( &pxFunctionList,
++                                          &xSlotId,
++                                          &xSession );
++
++        if( xResult == CKR_OK )
++        {
++            configPRINTF( ( "Certificate exists! Run demo.\n" ));
++        }
++        else
++        {
++            configPRINTF( ( "Certificate does not exist. Generate it.\n" ));
++            jitrDemoContext.pcJITRClientPrivateKey  = pvPortMalloc( MAX_AUTOGEN_ARRAY_SIZE );
++            jitrDemoContext.pcJITRClientCertificate = pvPortMalloc( MAX_AUTOGEN_ARRAY_SIZE );
++            jitrDemoContext.pcJITRClientTempRequest = pvPortMalloc( MAX_AUTOGEN_ARRAY_SIZE );
++
++            if ( jitrDemoContext.pcJITRClientPrivateKey == NULL
++                 || jitrDemoContext.pcJITRClientCertificate == NULL
++                 || jitrDemoContext.pcJITRClientTempRequest == NULL )
++            {
++                configPRINTF( ( "pvPortMalloc failed.\n" ));
++            }
++            else
++            {
++                memset(jitrDemoContext.pcJITRClientPrivateKey, 0, MAX_AUTOGEN_ARRAY_SIZE);
++                memset(jitrDemoContext.pcJITRClientCertificate, 0, MAX_AUTOGEN_ARRAY_SIZE);
++                memset(jitrDemoContext.pcJITRClientTempRequest, 0, MAX_AUTOGEN_ARRAY_SIZE);
++
++                if ( Iot_CreateDetachedThread( vGenerateProcedure,
++                                            &jitrDemoContext,
++                                            democonfigDEMO_PRIORITY,
++                                            democonfigDEMO_STACKSIZE ) )
++                {
++                    xParams->pcClientPrivateKey = ( uint8_t * ) jitrDemoContext.pcJITRClientPrivateKey;
++                    xParams->pcClientCertificate = ( uint8_t * ) jitrDemoContext.pcJITRClientCertificate;
++                    xParams->ulClientPrivateKeyLength = 1 + strlen( ( const char * ) jitrDemoContext.pcJITRClientPrivateKey );
++                    xParams->ulClientCertificateLength = 1 + strlen( ( const char * ) jitrDemoContext.pcJITRClientCertificate );
++                
++                    xResult = xProvisionDevice( xSession, xParams );
++                }
++                else
++                {
++                    configPRINTF( ( " . Iot_CreateDetachedThread vGenerateProcess failed ...\n" ) );
++                }
++            }
++        }
++#else
+         xResult = xProvisionDevice( xSession, xParams );
++#endif
++
++#if defined( CONFIG_JITR_DEMO_ENABLED )
++        vPortFree( jitrDemoContext.pcJITRClientPrivateKey );
++        vPortFree( jitrDemoContext.pcJITRClientCertificate );
++        vPortFree( jitrDemoContext.pcJITRClientTempRequest );
++#endif
+     }
+ 
+     pxFunctionList->C_CloseSession( xSession );
+diff --git a/demos/include/aws_clientcredential_keys.h b/demos/include/aws_clientcredential_keys.h
+index 680c7521a..a6d97fa5f 100644
+--- a/demos/include/aws_clientcredential_keys.h
++++ b/demos/include/aws_clientcredential_keys.h
+@@ -37,7 +37,7 @@
+  * "...base64 data...\n"\
+  * "-----END CERTIFICATE-----\n"
+  */
+-#define keyCLIENT_CERTIFICATE_PEM                   ""
++#define keyCLIENT_CERTIFICATE_PEM                   "mock"
+ 
+ /*
+  * @brief PEM-encoded issuer certificate for AWS IoT Just In Time Registration (JITR).
+@@ -60,6 +60,8 @@
+  */
+ #define keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM    ""
+ 
++#define keyJITR_DEVICE_CERTIFICATE_AUTHORITY_KEY_PEM ""
++
+ /*
+  * @brief PEM-encoded client private key.
+  *
+@@ -71,6 +73,6 @@
+  * "...base64 data...\n"\
+  * "-----END RSA PRIVATE KEY-----\n"
+  */
+-#define keyCLIENT_PRIVATE_KEY_PEM                   ""
++#define keyCLIENT_PRIVATE_KEY_PEM                   "mock"
+ 
+ #endif /* AWS_CLIENT_CREDENTIAL_KEYS_H */
+diff --git a/demos/include/iot_demo_runner.h b/demos/include/iot_demo_runner.h
+index cf4c2cfd2..b429b0df6 100644
+--- a/demos/include/iot_demo_runner.h
++++ b/demos/include/iot_demo_runner.h
+@@ -54,6 +54,8 @@
+     #define DEMO_entryFUNCTION                              vStartOTAUpdateDemoTask
+ #elif defined (CONFIG_BLE_GATT_SERVER_DEMO_ENABLED)
+     #define DEMO_entryFUNCTION                              vGattDemoSvcInit
++#elif defined (CONFIG_JITR_DEMO_ENABLED)
++    #define DEMO_entryFUNCTION                              RunJITRDemo
+ #else
+ /* if no demo was defined there will be no entry point defined and we will not be able to run the demo */
+     #error "No demo to run. One demo should be enabled"
+diff --git a/demos/jitr/CMakeLists.txt b/demos/jitr/CMakeLists.txt
+new file mode 100644
+index 000000000..f022eaf1d
+--- /dev/null
++++ b/demos/jitr/CMakeLists.txt
+@@ -0,0 +1,16 @@
++# C SDK MQTT demo
++afr_demo_module(jitr)
++
++afr_module_sources(
++    ${AFR_CURRENT_MODULE}
++    INTERFACE
++        "${CMAKE_CURRENT_LIST_DIR}/jitr.c"
++)
++afr_module_dependencies(
++    ${AFR_CURRENT_MODULE}
++    INTERFACE
++		AFR::mqtt
++)
++
++
++
+diff --git a/demos/jitr/jitr.c b/demos/jitr/jitr.c
+new file mode 100644
+index 000000000..4f1d7914a
+--- /dev/null
++++ b/demos/jitr/jitr.c
+@@ -0,0 +1,315 @@
++/*
++ * Amazon FreeRTOS V201906.00 Major
++ * Copyright (C) 2019 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://aws.amazon.com/freertos
++ * http://www.FreeRTOS.org
++ */
++
++#include <stdio.h>
++#include <string.h>
++
++#include "aws_clientcredential_keys.h"
++#include "platform/iot_threads.h"
++#include "platform/iot_clock.h"
++
++/* MQTT include. */
++#include "iot_mqtt.h"
++
++/* MQTT defines. */
++#ifndef IOT_DEMO_MQTT_PUBLISH_BURST_SIZE
++    #define IOT_DEMO_MQTT_PUBLISH_BURST_SIZE     ( 10 )
++#endif
++#ifndef IOT_DEMO_MQTT_PUBLISH_BURST_COUNT
++    #define IOT_DEMO_MQTT_PUBLISH_BURST_COUNT    ( 10 )
++#endif
++
++#define TOPIC_FILTER_COUNT                       ( 4 )
++#define CLIENT_IDENTIFIER_MAX_LENGTH             ( 24 )
++#define KEEP_ALIVE_SECONDS                       ( 60 )
++#define MQTT_TIMEOUT_MS                          ( 5000 )
++#define PUBLISH_RETRY_MS                         ( 1000 )
++#define PUBLISH_RETRY_LIMIT                      ( 10 )
++#define CLIENT_IDENTIFIER_PREFIX                 "dsn_xx_"
++#define PUBLISH_PAYLOAD_FORMAT                   "Hello world %d!"
++#define PUBLISH_PAYLOAD_BUFFER_LENGTH            ( sizeof( PUBLISH_PAYLOAD_FORMAT ) + 2 )
++#define TOPIC_FILTER_LENGTH                      ( ( uint16_t ) ( sizeof( "jitr/demo/topic/1" ) - 1 ) )
++#define MQTT_CONNECT_RETRY_LIMIT                 ( 5 )
++
++int RunJITRDemo( bool awsIotMqttMode,
++                 const char * pIdentifier,
++                 void * pNetworkServerInfo,
++                 void * pNetworkCredentialInfo,
++                 const IotNetworkInterface_t * pNetworkInterface );
++
++static int _initializeDemo( void )
++{
++    int status = EXIT_SUCCESS;
++    IotMqttError_t mqttInitStatus = IOT_MQTT_SUCCESS;
++
++    mqttInitStatus = IotMqtt_Init();
++
++    if( mqttInitStatus != IOT_MQTT_SUCCESS )
++    {
++        /* Failed to initialize MQTT library. */
++        status = EXIT_FAILURE;
++    }
++
++    return status;
++}
++
++static int _establishMqttConnection( bool awsIotMqttMode,
++                                     const char * pIdentifier,
++                                     void * pNetworkServerInfo,
++                                     void * pNetworkCredentialInfo,
++                                     const IotNetworkInterface_t * pNetworkInterface,
++                                     IotMqttConnection_t * pMqttConnection )
++{
++    int status = EXIT_SUCCESS;
++    int retryCount = 0;
++    uint32_t mqtt_backoff_timeout_ms = 1 << 12;
++    IotMqttError_t connectStatus = IOT_MQTT_STATUS_PENDING;
++    IotMqttNetworkInfo_t networkInfo = IOT_MQTT_NETWORK_INFO_INITIALIZER;
++    IotMqttConnectInfo_t connectInfo = IOT_MQTT_CONNECT_INFO_INITIALIZER;
++    char pClientIdentifierBuffer[ CLIENT_IDENTIFIER_MAX_LENGTH ] = { 0 };
++    uint8_t mac[6];
++    char identifier_name[CLIENT_IDENTIFIER_MAX_LENGTH];
++
++    /* Set the members of the network info not set by the initializer. This
++     * struct provided information on the transport layer to the MQTT connection. */
++    networkInfo.createNetworkConnection = true;
++    networkInfo.u.setup.pNetworkServerInfo = pNetworkServerInfo;
++    networkInfo.u.setup.pNetworkCredentialInfo = pNetworkCredentialInfo;
++    networkInfo.pNetworkInterface = pNetworkInterface;
++
++    /* Set the members of the connection info not set by the initializer. */
++    connectInfo.awsIotMqttMode = awsIotMqttMode;
++    connectInfo.cleanSession = true;
++    connectInfo.keepAliveSeconds = KEEP_ALIVE_SECONDS;
++
++    /* Use mac address "dsn_xx_0123456789ab" format as
++     * unique client identifier(i.e. thing name). */
++    if ( esp_read_mac( mac, ESP_MAC_WIFI_STA ) == 0 )
++    {
++        status = snprintf( identifier_name, sizeof( identifier_name ), 
++                           CLIENT_IDENTIFIER_PREFIX "%02x%02x%02x%02x%02x%02x",
++                           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] );
++
++        if (status < 0)
++        {
++            configPRINTF( ( "Failed to generate unique client identifier for demo.\n" ) );
++            status = EXIT_FAILURE;
++            return status;
++        }
++
++        connectInfo.pClientIdentifier = identifier_name;
++        connectInfo.clientIdentifierLength = ( uint16_t ) strlen( identifier_name );
++        status = EXIT_SUCCESS;
++    }
++    else
++    {
++        status = EXIT_FAILURE;
++        return status;
++    }
++
++    /* Establish the MQTT connection. */
++    if( status == EXIT_SUCCESS )
++    {
++        configPRINTF( ( "JITR demo client identifier is %.*s (length %hu).\n",
++                    connectInfo.clientIdentifierLength,
++                    connectInfo.pClientIdentifier,
++                    connectInfo.clientIdentifierLength ) );
++
++        /* Retry 5 times and do a exponential backoff timeout. */
++        do 
++        {
++            if ( retryCount > MQTT_CONNECT_RETRY_LIMIT )
++            {
++                configPRINTF( ( "Hit maximum retry count. Error on connecting to MQTT\n" ) );
++                break;
++            }
++
++
++            connectStatus = IotMqtt_Connect( &networkInfo,
++                                             &connectInfo,
++                                             mqtt_backoff_timeout_ms,
++                                             pMqttConnection );
++
++            mqtt_backoff_timeout_ms <<= 1;
++            retryCount += 1;
++        }
++        while ( connectStatus != IOT_MQTT_SUCCESS );
++
++        if( connectStatus != IOT_MQTT_SUCCESS )
++        {
++            configPRINTF( ( "MQTT CONNECT returned error %s.\n",
++                         IotMqtt_strerror( connectStatus ) ) );
++
++            status = EXIT_FAILURE;
++        }
++    }
++
++    return status;
++}
++
++static int _publishAllMessages( IotMqttConnection_t mqttConnection,
++                                const char ** pTopicNames,
++                                IotSemaphore_t * pPublishReceivedCounter )
++{
++    int status = EXIT_SUCCESS;
++    intptr_t publishCount = 0;
++    IotMqttError_t publishStatus = IOT_MQTT_STATUS_PENDING;
++    IotMqttPublishInfo_t publishInfo = IOT_MQTT_PUBLISH_INFO_INITIALIZER;
++    char pPublishPayload[ PUBLISH_PAYLOAD_BUFFER_LENGTH ] = { 0 };
++
++    /* Set the common members of the publish info. */
++    publishInfo.qos = IOT_MQTT_QOS_1;
++    publishInfo.topicNameLength = TOPIC_FILTER_LENGTH;
++    publishInfo.pPayload = pPublishPayload;
++    publishInfo.retryMs = PUBLISH_RETRY_MS;
++    publishInfo.retryLimit = PUBLISH_RETRY_LIMIT;
++
++    /* Loop to PUBLISH all messages of this demo. */
++    for( publishCount = 0; 
++         publishCount < IOT_DEMO_MQTT_PUBLISH_BURST_SIZE * IOT_DEMO_MQTT_PUBLISH_BURST_COUNT; 
++         publishCount++ )
++    {
++        /* Announce which burst of messages is being published. */
++        if( publishCount % IOT_DEMO_MQTT_PUBLISH_BURST_SIZE == 0 )
++        {
++            configPRINTF( ( "Publishing messages %d to %d.",
++                        publishCount,
++                        publishCount + IOT_DEMO_MQTT_PUBLISH_BURST_SIZE - 1 ) );
++        }
++
++        /* Choose a topic name (round-robin through the array of topic names). */
++        publishInfo.pTopicName = pTopicNames[ publishCount % TOPIC_FILTER_COUNT ];
++
++        /* Generate the payload for the PUBLISH. */
++        status = snprintf( pPublishPayload,
++                           PUBLISH_PAYLOAD_BUFFER_LENGTH,
++                           PUBLISH_PAYLOAD_FORMAT,
++                           ( int ) publishCount );
++
++        /* Check for errors from snprintf. */
++        if( status < 0 )
++        {
++            configPRINTF( ( "Failed to generate MQTT PUBLISH payload for PUBLISH %d.\n",
++                         ( int ) publishCount ) );
++            status = EXIT_FAILURE;
++
++            break;
++        }
++        else
++        {
++            publishInfo.payloadLength = ( size_t ) status;
++            status = EXIT_SUCCESS;
++        }
++
++        /* PUBLISH a message. This is an asynchronous function that notifies of
++         * completion through a callback. */
++        publishStatus = IotMqtt_Publish( mqttConnection,
++                                         &publishInfo,
++                                         0,
++                                         NULL,
++                                         NULL );
++
++        if( publishStatus != IOT_MQTT_STATUS_PENDING )
++        {
++            configPRINTF( ( "MQTT PUBLISH %d returned error %s.\n",
++                         ( int ) publishCount,
++                         IotMqtt_strerror( publishStatus ) ) );
++            status = EXIT_FAILURE;
++
++            break;
++        }
++    }
++
++    return status;
++}
++
++int RunJITRDemo( bool awsIotMqttMode,
++                 const char * pIdentifier,
++                 void * pNetworkServerInfo,
++                 void * pNetworkCredentialInfo,
++                 const IotNetworkInterface_t * pNetworkInterface )
++{
++    int status = EXIT_SUCCESS;
++    bool librariesInitialized = false, connectionEstablished = false;
++    IotMqttConnection_t mqttConnection = IOT_MQTT_CONNECTION_INITIALIZER;
++    IotSemaphore_t publishesReceived;
++    /* Topics used as both topic filters and topic names in this demo. */
++    const char * pTopics[ TOPIC_FILTER_COUNT ] =
++    {
++        "iotdemo/topic/1",
++        "iotdemo/topic/2",
++        "iotdemo/topic/3",
++        "iotdemo/topic/4"
++    };
++
++    status = _initializeDemo();
++
++    if( status == EXIT_SUCCESS )
++    {
++        /* Mark the libraries as initialized. */
++        librariesInitialized = true;
++
++        /* Establish a new MQTT connection. */
++        status = _establishMqttConnection( awsIotMqttMode,
++                                           pIdentifier,
++                                           pNetworkServerInfo,
++                                           pNetworkCredentialInfo,
++                                           pNetworkInterface,
++                                           &mqttConnection );
++    }
++
++    if( status == EXIT_SUCCESS )
++    {
++        /* Mark the MQTT connection as established. */
++        connectionEstablished = true;
++
++        if( IotSemaphore_Create( &publishesReceived,
++                                 0,
++                                 IOT_DEMO_MQTT_PUBLISH_BURST_SIZE ) == true )
++        {
++            status = _publishAllMessages( mqttConnection, 
++                                          pTopics, 
++                                          &publishesReceived );
++
++            IotSemaphore_Destroy( &publishesReceived );
++        }
++        else
++        {
++            status = EXIT_FAILURE;
++        }
++    }
++
++    if( connectionEstablished == true )
++    {
++        IotMqtt_Disconnect( mqttConnection, 0 );
++    }
++
++    if( librariesInitialized == true )
++    {
++        IotMqtt_Cleanup();
++    }
++
++    return status;
++}
+diff --git a/libraries/c_sdk/aws/keygen/CMakeLists.txt b/libraries/c_sdk/aws/keygen/CMakeLists.txt
+new file mode 100644
+index 000000000..73b1ff24a
+--- /dev/null
++++ b/libraries/c_sdk/aws/keygen/CMakeLists.txt
+@@ -0,0 +1,30 @@
++afr_module()
++
++afr_set_lib_metadata(ID "keygen")
++afr_set_lib_metadata(DESCRIPTION "This library helps to generate device private key and certificate.")
++afr_set_lib_metadata(DISPLAY_NAME "Device Key and Certificate Generator")
++afr_set_lib_metadata(CATEGORY "Amazon Services")
++afr_set_lib_metadata(VERSION "1.0.0")
++afr_set_lib_metadata(IS_VISIBLE "true")
++
++set(src_dir "${CMAKE_CURRENT_LIST_DIR}/src")
++set(inc_dir "${CMAKE_CURRENT_LIST_DIR}/include")
++
++afr_module_sources(
++    ${AFR_CURRENT_MODULE}
++    PUBLIC
++        "${src_dir}/aws_iot_key_gen.c"
++        "${inc_dir}/aws_iot_key_gen.h"
++)
++
++afr_module_include_dirs(
++    ${AFR_CURRENT_MODULE}
++    PUBLIC
++        "${inc_dir}"
++)
++
++afr_module_dependencies(
++    ${AFR_CURRENT_MODULE}
++    PUBLIC
++        3rdparty::mbedtls
++)
+diff --git a/libraries/c_sdk/aws/keygen/include/aws_iot_key_gen.h b/libraries/c_sdk/aws/keygen/include/aws_iot_key_gen.h
+new file mode 100644
+index 000000000..985152809
+--- /dev/null
++++ b/libraries/c_sdk/aws/keygen/include/aws_iot_key_gen.h
+@@ -0,0 +1,38 @@
++/*
++ * Amazon FreeRTOS V201906.00 Major
++ * Copyright (C) 2019 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://aws.amazon.com/freertos
++ * http://www.FreeRTOS.org
++ */
++
++#ifndef AWS_IOT_KEYGEN_H_
++#define AWS_IOT_KEYGEN_H_
++
++typedef struct devCertificateKeyContext
++{
++    unsigned char * pcJITRClientPrivateKey;
++    unsigned char * pcJITRClientCertificate;
++    unsigned char * pcJITRClientTempRequest;
++}  devCertificateKeyContext_t;
++
++void vGenerateProcedure( void * pArgument );
++
++#endif /* AWS_IOT_KEYGEN_H_ */
+diff --git a/libraries/c_sdk/aws/keygen/src/aws_iot_key_gen.c b/libraries/c_sdk/aws/keygen/src/aws_iot_key_gen.c
+new file mode 100644
+index 000000000..6938a26bb
+--- /dev/null
++++ b/libraries/c_sdk/aws/keygen/src/aws_iot_key_gen.c
+@@ -0,0 +1,293 @@
++/*
++ * Amazon FreeRTOS V201906.00 Major
++ * Copyright (C) 2019 Amazon.com, Inc. or its affiliates.  All Rights Reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of
++ * this software and associated documentation files (the "Software"), to deal in
++ * the Software without restriction, including without limitation the rights to
++ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
++ * the Software, and to permit persons to whom the Software is furnished to do so,
++ * subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all
++ * copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
++ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
++ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
++ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ *
++ * http://aws.amazon.com/freertos
++ * http://www.FreeRTOS.org
++ */
++
++#if !defined(MBEDTLS_CONFIG_FILE)
++#include "mbedtls/config.h"
++#else
++#include MBEDTLS_CONFIG_FILE
++#endif
++
++#if defined(MBEDTLS_PLATFORM_C)
++#include "mbedtls/platform.h"
++#endif
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdbool.h>
++#include <unistd.h>
++
++#if !defined(MBEDTLS_X509_CSR_WRITE_C) || !defined(MBEDTLS_FS_IO) ||  \
++    !defined(MBEDTLS_PK_PARSE_C) || !defined(MBEDTLS_SHA256_C) || \
++    !defined(MBEDTLS_ENTROPY_C) || !defined(MBEDTLS_CTR_DRBG_C) || \
++    !defined(MBEDTLS_PEM_WRITE_C)
++void vGenerateProcedure( void )
++{
++    configPRINTF( ( "MBEDTLS_X509_CSR_WRITE_C and/or MBEDTLS_FS_IO and/or "
++            "MBEDTLS_PK_PARSE_C and/or MBEDTLS_SHA256_C and/or "
++            "MBEDTLS_ENTROPY_C and/or MBEDTLS_CTR_DRBG_C "
++            "not defined.\n" ) );
++}
++#else
++/* mbedtls includes. */
++#include "mbedtls/error.h"
++#include "mbedtls/pk.h"
++#include "mbedtls/rsa.h"
++#include "mbedtls/entropy.h"
++#include "mbedtls/ctr_drbg.h"
++#include "mbedtls/x509_crt.h"
++#include "mbedtls/x509_csr.h"
++
++/* server CAs and key information includes. */
++#include "aws_clientcredential_keys.h"
++#include "aws_iot_key_gen.h"
++#include "aws_jitr_config.h"
++
++/* mbedtls defines. */
++#define DFL_TYPE                MBEDTLS_PK_RSA
++#define DFL_RSA_KEYSIZE         2048
++#define DFL_MD_ALG              MBEDTLS_MD_SHA256
++#define DFL_RSA_KEYLENGTH       2048
++#define DFL_RSA_REQLENGTH       2048
++#define DFL_RSA_CRTLENGTH       2048
++
++/* DSN defines. */
++#define MAC_ADDR_LENGTH         6
++#define DSN_LENGTH              16
++
++mbedtls_entropy_context gEntropy;
++mbedtls_ctr_drbg_context gCtr_drbg;
++
++void vGenerateProcedure( void * pArgument )
++{
++    int ret = 0;
++    const char *pers = "gen_key_cert";
++    mbedtls_pk_context key;
++    mbedtls_x509write_csr req;
++    mbedtls_x509write_cert crt;
++    mbedtls_x509_crt issuer_crt;
++    mbedtls_pk_context loaded_issuer_key, loaded_subject_key;
++    mbedtls_pk_context *issuer_key = &loaded_issuer_key,
++                *subject_key = &loaded_subject_key;
++    char issuer_name[256];
++    char subject_name[256];
++    mbedtls_x509_csr csr;
++    mbedtls_mpi serial;
++    uint8_t mac[MAC_ADDR_LENGTH];
++    char mac_adr[DSN_LENGTH];
++    devCertificateKeyContext_t * pContext = ( devCertificateKeyContext_t * ) pArgument;
++
++    mbedtls_ctr_drbg_init( &gCtr_drbg );
++    mbedtls_entropy_init( &gEntropy );
++    mbedtls_pk_init( &key );
++    mbedtls_x509write_crt_init( &crt );
++    mbedtls_pk_init( &loaded_issuer_key );
++    mbedtls_pk_init( &loaded_subject_key );
++    mbedtls_mpi_init( &serial );
++    mbedtls_x509_csr_init( &csr );
++    mbedtls_x509_crt_init( &issuer_crt );
++
++    /* Generate random seed */
++    if ( mbedtls_ctr_drbg_seed( &gCtr_drbg, mbedtls_entropy_func, &gEntropy,
++                                        ( const unsigned char *) pers,
++                                        strlen( pers ) ) != 0 )
++    {
++        configPRINTF( ( " . Seeding the random number generator failed ...\n" ) );
++        goto exit;
++    }
++
++    /* Generate device key */
++    configPRINTF( ( " . Generating device private key ...\n" ) );
++    if( mbedtls_pk_setup( &key, mbedtls_pk_info_from_type( DFL_TYPE ) ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_pk_setup failed ...\n" ) );
++        goto exit;
++    }
++
++    if ( mbedtls_rsa_gen_key( mbedtls_pk_rsa( key ), 
++                                mbedtls_ctr_drbg_random, &gCtr_drbg,
++                                DFL_RSA_KEYSIZE, 65537 ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_rsa_gen_key failed ...\n" ) );
++        goto exit;
++    }
++
++    mbedtls_pk_write_key_pem( &key, pContext->pcJITRClientPrivateKey, DFL_RSA_KEYLENGTH );
++
++    /* Generate temporary csr */
++    mbedtls_x509write_csr_init( &req );
++
++    configPRINTF( ( " . Generating temporary csr ...\n" ) );
++
++    mbedtls_x509write_csr_set_md_alg( &req, DFL_MD_ALG );
++    if( mbedtls_x509write_csr_set_subject_name( &req, DFL_SUBJECT_NAME ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_csr_set_subject_name failed ...\n" ) );
++        goto exit;
++    }
++
++    mbedtls_x509write_csr_set_key( &req, &key );
++
++    if( mbedtls_x509write_csr_pem( &req, pContext->pcJITRClientTempRequest, DFL_RSA_REQLENGTH, 
++                                    mbedtls_ctr_drbg_random, &gCtr_drbg ) < 0 )
++    {   
++        configPRINTF( ( " . mbedtls_x509write_csr_pem failed ...\n" ) );
++        goto exit;
++    }
++
++    /* Generate device certificate */
++    configPRINTF( ( " . Generating device certificate ...\n" ) );
++
++    /* Get Wi-Fi MAC address as device serial number(DSN). */
++    if ( esp_read_mac( mac, ESP_MAC_WIFI_STA ) == 0 )
++    {
++        snprintf( mac_adr, sizeof( mac_adr ), "%02X%02X%02X%02X%02X%02X",
++                            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5] );
++
++        configPRINTF( ( "MAC : %s\n", mac_adr ) );
++    }
++    else
++    {
++        configPRINTF( ( " . get mac address failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_mpi_read_string( &serial, 16, mac_adr ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_mpi_read_string failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509_crt_parse( &issuer_crt, 
++        ( const unsigned char * ) keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM, 
++        sizeof( keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM ) ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509_crt_parse issuer_crt failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509_dn_gets( issuer_name, sizeof( issuer_name ), &issuer_crt.subject ) < 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509_dn_gets issuer_name failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509_csr_parse( &csr, ( const unsigned char * ) pContext->pcJITRClientTempRequest, 
++                            strlen( ( const char * ) pContext->pcJITRClientTempRequest ) + 1 ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509_csr_parse failed ...\n" ) );
++        goto exit;
++    }
++
++    if ( mbedtls_x509_dn_gets( subject_name, sizeof(subject_name), &csr.subject ) < 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509_dn_gets subject_name failed ...\n" ) );
++        goto exit;
++    }
++
++    subject_key = &csr.pk;
++    if ( mbedtls_pk_parse_key( &loaded_issuer_key, 
++                (const unsigned char * ) keyJITR_DEVICE_CERTIFICATE_AUTHORITY_KEY_PEM, 
++                sizeof( keyJITR_DEVICE_CERTIFICATE_AUTHORITY_KEY_PEM ), NULL, 0 ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_pk_parse_key issuer_key failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_pk_check_pair( &issuer_crt.pk, issuer_key ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_pk_check_pair failed ...\n" ) );
++        goto exit;
++    }
++
++    mbedtls_x509write_crt_set_subject_key( &crt, subject_key );
++    mbedtls_x509write_crt_set_issuer_key( &crt, issuer_key );
++
++    if( mbedtls_x509write_crt_set_subject_name( &crt, subject_name ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_subject_name failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509write_crt_set_issuer_name( &crt, issuer_name ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_issuer_name failed ...\n" ) );
++        goto exit;
++    }
++
++    mbedtls_x509write_crt_set_version( &crt, 2 );
++    mbedtls_x509write_crt_set_md_alg( &crt, MBEDTLS_MD_SHA256 );
++
++    if( mbedtls_x509write_crt_set_serial( &crt, &serial ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_serial failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509write_crt_set_validity( &crt, DFL_NOT_BEFORE, DFL_NOT_AFTER ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_validity failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509write_crt_set_basic_constraints( &crt, 0, -1 ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_basic_constraints failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509write_crt_set_subject_key_identifier( &crt ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_subject_key_identifier failed ...\n" ) );
++        goto exit;
++    }
++
++    if( mbedtls_x509write_crt_set_authority_key_identifier( &crt ) != 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_set_authority_key_identifier failed ...\n" ) );
++        goto exit;
++    }
++
++    if( ( ret = mbedtls_x509write_crt_pem( &crt, pContext->pcJITRClientCertificate, DFL_RSA_CRTLENGTH, 
++                mbedtls_ctr_drbg_random, &gCtr_drbg ) ) < 0 )
++    {
++        configPRINTF( ( " . mbedtls_x509write_crt_pem failed ...\n" ) );
++        goto exit;
++    }
++
++exit:
++
++    mbedtls_ctr_drbg_free( &gCtr_drbg );
++    mbedtls_entropy_free( &gEntropy );
++    mbedtls_pk_free( &key );
++    mbedtls_x509write_csr_free( &req );
++    mbedtls_x509_csr_free( &csr );
++    mbedtls_x509_crt_free( &issuer_crt );
++    mbedtls_pk_free( &loaded_subject_key );
++    mbedtls_pk_free( &loaded_issuer_key );
++    mbedtls_mpi_free( &serial );
++}
++#endif /* MBEDTLS_X509_CSR_WRITE_C && MBEDTLS_PK_PARSE_C && MBEDTLS_FS_IO &&
++          MBEDTLS_ENTROPY_C && MBEDTLS_CTR_DRBG_C && MBEDTLS_PEM_WRITE_C */
+diff --git a/tests/include/aws_clientcredential_keys.h b/tests/include/aws_clientcredential_keys.h
+index 680c7521a..a6d97fa5f 100644
+--- a/tests/include/aws_clientcredential_keys.h
++++ b/tests/include/aws_clientcredential_keys.h
+@@ -37,7 +37,7 @@
+  * "...base64 data...\n"\
+  * "-----END CERTIFICATE-----\n"
+  */
+-#define keyCLIENT_CERTIFICATE_PEM                   ""
++#define keyCLIENT_CERTIFICATE_PEM                   "mock"
+ 
+ /*
+  * @brief PEM-encoded issuer certificate for AWS IoT Just In Time Registration (JITR).
+@@ -60,6 +60,8 @@
+  */
+ #define keyJITR_DEVICE_CERTIFICATE_AUTHORITY_PEM    ""
+ 
++#define keyJITR_DEVICE_CERTIFICATE_AUTHORITY_KEY_PEM ""
++
+ /*
+  * @brief PEM-encoded client private key.
+  *
+@@ -71,6 +73,6 @@
+  * "...base64 data...\n"\
+  * "-----END RSA PRIVATE KEY-----\n"
+  */
+-#define keyCLIENT_PRIVATE_KEY_PEM                   ""
++#define keyCLIENT_PRIVATE_KEY_PEM                   "mock"
+ 
+ #endif /* AWS_CLIENT_CREDENTIAL_KEYS_H */
+diff --git a/vendors/espressif/boards/esp32/aws_demos/application_code/espressif_code/amazon-freertos-common/component.mk b/vendors/espressif/boards/esp32/aws_demos/application_code/espressif_code/amazon-freertos-common/component.mk
+index ff78c0a20..7cb7060f6 100644
+--- a/vendors/espressif/boards/esp32/aws_demos/application_code/espressif_code/amazon-freertos-common/component.mk
++++ b/vendors/espressif/boards/esp32/aws_demos/application_code/espressif_code/amazon-freertos-common/component.mk
+@@ -38,6 +38,7 @@ COMPONENT_SRCDIRS := $(AMAZON_FREERTOS_SDK_DIR)/standard/mqtt/src \
+         $(AMAZON_FREERTOS_SDK_DIR)/standard/serializer/src/json \
+         $(AMAZON_FREERTOS_SDK_DIR)/aws/defender/src \
+         $(AMAZON_FREERTOS_SDK_DIR)/aws/shadow/src \
++        $(AMAZON_FREERTOS_SDK_DIR)/aws/keygen/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/aws/greengrass/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/aws/ota/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/tls/src \
+@@ -63,10 +64,12 @@ COMPONENT_ADD_INCLUDEDIRS := $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_p
+                              $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_plus_tcp/include \
+                              $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_plus_tcp/source/portable/Compiler/GCC \
+                              $(AMAZON_FREERTOS_SDK_DIR)/standard/ble/include \
++                             $(AMAZON_FREERTOS_SDK_DIR)/aws/keygen/include \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/jsmn \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/tinycbor \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/freertos/include \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/include \
++                             $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/include/platform \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/pkcs11 \
+                              $(AMAZON_FREERTOS_SDK_DIR)/standard/serializer/include \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/ble_hal/include \
+@@ -159,7 +162,8 @@ COMPONENT_SRCDIRS += ../.. \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/ble \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/network_manager \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/wifi_provisioning \
+-    $(AMAZON_FREERTOS_DEMOS_DIR)/tcp
++    $(AMAZON_FREERTOS_DEMOS_DIR)/tcp \
++    $(AMAZON_FREERTOS_DEMOS_DIR)/jitr
+ 
+ COMPONENT_ADD_INCLUDEDIRS += $(AMAZON_FREERTOS_DEMOS_DIR)/include \
+                              $(AMAZON_FREERTOS_DEMOS_DIR)/network_manager 
+diff --git a/vendors/espressif/boards/esp32/aws_demos/config_files/aws_demo_config.h b/vendors/espressif/boards/esp32/aws_demos/config_files/aws_demo_config.h
+index 3d8d271bf..d10c4a7dd 100644
+--- a/vendors/espressif/boards/esp32/aws_demos/config_files/aws_demo_config.h
++++ b/vendors/espressif/boards/esp32/aws_demos/config_files/aws_demo_config.h
+@@ -40,7 +40,7 @@
+             
+     These defines are used in iot_demo_runner.h for demo selection */
+ 
+-#define CONFIG_MQTT_DEMO_ENABLED
++#define CONFIG_JITR_DEMO_ENABLED
+ 
+ /* Default configuration for all demos. Individual demos can override these below */
+ #define democonfigDEMO_STACKSIZE               ( configMINIMAL_STACK_SIZE * 8 )
+@@ -52,6 +52,13 @@
+     #define democonfigNETWORK_TYPES                          (  AWSIOT_NETWORK_TYPE_WIFI|AWSIOT_NETWORK_TYPE_BLE )
+ #endif
+ 
++#if defined( CONFIG_JITR_DEMO_ENABLED )
++    #undef democonfigNETWORK_TYPES
++    #define democonfigNETWORK_TYPES                          (  AWSIOT_NETWORK_TYPE_WIFI|AWSIOT_NETWORK_TYPE_BLE )
++    #undef democonfigDEMO_STACKSIZE
++    #define democonfigDEMO_STACKSIZE          ( configMINIMAL_STACK_SIZE * 16 )
++#endif
++
+ #if defined( CONFIG_OTA_UPDATE_DEMO_ENABLED )
+     #undef democonfigNETWORK_TYPES
+     #define democonfigNETWORK_TYPES                          ( AWSIOT_NETWORK_TYPE_WIFI  )
+diff --git a/vendors/espressif/boards/esp32/aws_demos/config_files/aws_jitr_config.h b/vendors/espressif/boards/esp32/aws_demos/config_files/aws_jitr_config.h
+new file mode 100644
+index 000000000..0743f69f6
+--- /dev/null
++++ b/vendors/espressif/boards/esp32/aws_demos/config_files/aws_jitr_config.h
+@@ -0,0 +1,8 @@
++#ifndef _AWS_JITR_CONFIG_H_
++#define _AWS_JITR_CONFIG_H_
++
++#define DFL_SUBJECT_NAME        "CN=example.com,O=Example Ltd,C=UK"
++#define DFL_NOT_BEFORE          "20010101000000"
++#define DFL_NOT_AFTER           "20301231235959"
++
++#endif /* _AWS_JITR_CONFIG_H_ */
+\ No newline at end of file
+diff --git a/vendors/espressif/boards/esp32/aws_tests/application_code/espressif_code/amazon-freertos-tests/component.mk b/vendors/espressif/boards/esp32/aws_tests/application_code/espressif_code/amazon-freertos-tests/component.mk
+index ff78c0a20..7cb7060f6 100644
+--- a/vendors/espressif/boards/esp32/aws_tests/application_code/espressif_code/amazon-freertos-tests/component.mk
++++ b/vendors/espressif/boards/esp32/aws_tests/application_code/espressif_code/amazon-freertos-tests/component.mk
+@@ -38,6 +38,7 @@ COMPONENT_SRCDIRS := $(AMAZON_FREERTOS_SDK_DIR)/standard/mqtt/src \
+         $(AMAZON_FREERTOS_SDK_DIR)/standard/serializer/src/json \
+         $(AMAZON_FREERTOS_SDK_DIR)/aws/defender/src \
+         $(AMAZON_FREERTOS_SDK_DIR)/aws/shadow/src \
++        $(AMAZON_FREERTOS_SDK_DIR)/aws/keygen/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/aws/greengrass/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/aws/ota/src \
+         $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/tls/src \
+@@ -63,10 +64,12 @@ COMPONENT_ADD_INCLUDEDIRS := $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_p
+                              $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_plus_tcp/include \
+                              $(AMAZON_FREERTOS_ARF_PLUS_DIR)/standard/freertos_plus_tcp/source/portable/Compiler/GCC \
+                              $(AMAZON_FREERTOS_SDK_DIR)/standard/ble/include \
++                             $(AMAZON_FREERTOS_SDK_DIR)/aws/keygen/include \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/jsmn \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/tinycbor \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/freertos/include \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/include \
++                             $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/platform/include/platform \
+                              $(AMAZON_FREERTOS_3RD_PARTY_DIR)/pkcs11 \
+                              $(AMAZON_FREERTOS_SDK_DIR)/standard/serializer/include \
+                              $(AMAZON_FREERTOS_ABSTRACTIONS_DIR)/ble_hal/include \
+@@ -159,7 +162,8 @@ COMPONENT_SRCDIRS += ../.. \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/ble \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/network_manager \
+     $(AMAZON_FREERTOS_DEMOS_DIR)/wifi_provisioning \
+-    $(AMAZON_FREERTOS_DEMOS_DIR)/tcp
++    $(AMAZON_FREERTOS_DEMOS_DIR)/tcp \
++    $(AMAZON_FREERTOS_DEMOS_DIR)/jitr
+ 
+ COMPONENT_ADD_INCLUDEDIRS += $(AMAZON_FREERTOS_DEMOS_DIR)/include \
+                              $(AMAZON_FREERTOS_DEMOS_DIR)/network_manager 
+diff --git a/vendors/espressif/boards/esp32/aws_tests/config_files/aws_jitr_config.h b/vendors/espressif/boards/esp32/aws_tests/config_files/aws_jitr_config.h
+new file mode 100644
+index 000000000..0743f69f6
+--- /dev/null
++++ b/vendors/espressif/boards/esp32/aws_tests/config_files/aws_jitr_config.h
+@@ -0,0 +1,8 @@
++#ifndef _AWS_JITR_CONFIG_H_
++#define _AWS_JITR_CONFIG_H_
++
++#define DFL_SUBJECT_NAME        "CN=example.com,O=Example Ltd,C=UK"
++#define DFL_NOT_BEFORE          "20010101000000"
++#define DFL_NOT_AFTER           "20301231235959"
++
++#endif /* _AWS_JITR_CONFIG_H_ */
+\ No newline at end of file
+-- 
+2.20.1 (Apple Git-117)
+
